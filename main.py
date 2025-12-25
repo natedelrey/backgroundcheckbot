@@ -757,7 +757,7 @@ async def bgcheck(
                     return 0
 
             top_types = sorted(value_est["type_counts"].items(), key=lambda kv: num_prefix(kv[1]), reverse=True)[:5]
-            top_txt = ", ".join([f"{k}: {v}" for k, v in top_types if kv[1] != "0"]) if top_types else "n/a"
+          top_txt = ", ".join([f"{k}: {v}" for k, v in top_types if v != "0"]) if top_types else "n/a"
             inv_line = f"Sampled **{value_est['sampled']}** items (top: {safe_text(top_txt, 140)})"
 
             if value_est["est_value_robux"] is None:
