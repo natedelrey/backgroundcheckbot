@@ -2,6 +2,7 @@ import os
 import re
 import time
 import asyncio
+import random
 import requests
 import discord
 from discord import app_commands
@@ -69,14 +70,11 @@ create table if not exists ranklocks (
 
 async def ensure_db():
     global db_pool
-
     if db_pool is not None:
         return True
-
     if not DATABASE_URL:
         print("⚠️ DATABASE_URL missing — DB features disabled.")
         return False
-
     try:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         async with db_pool.acquire() as con:
@@ -139,7 +137,7 @@ def clamp(n: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 # =====================================================
-# HTTP wrapper (Roblox sometimes blocks cloud hosts)
+# HTTP wrapper
 # =====================================================
 
 ROBLOX_HEADERS = {
@@ -150,16 +148,12 @@ ROBLOX_HEADERS = {
 }
 
 def http_get(url: str, *, params=None, timeout=20, retries=3):
-    """
-    sync http get with retries + 429 backoff
-    NOTE: used inside asyncio.to_thread so time.sleep won't block the bot.
-    """
     last = None
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, headers=ROBLOX_HEADERS, timeout=timeout)
             if r.status_code == 429:
-                time.sleep(min(2.0 * (attempt + 1), 6.0))
+                time.sleep(min(1.5 * (attempt + 1), 5.0))
                 last = r
                 continue
             return r
@@ -174,7 +168,7 @@ def http_post(url: str, *, json=None, timeout=20, retries=3):
         try:
             r = requests.post(url, json=json, headers=ROBLOX_HEADERS, timeout=timeout)
             if r.status_code == 429:
-                time.sleep(min(2.0 * (attempt + 1), 6.0))
+                time.sleep(min(1.5 * (attempt + 1), 5.0))
                 last = r
                 continue
             return r
@@ -228,7 +222,7 @@ def account_age_days(created_iso: str) -> int:
     return (datetime.now(timezone.utc) - created_dt).days
 
 # =====================================================
-# Value estimation (inventory + catalog prices) + progress support
+# Value estimation (FASTER + realistic)
 # =====================================================
 
 ASSET_TYPES = [
@@ -246,13 +240,17 @@ ASSET_TYPES = [
     (18, "Faces"),
 ]
 
-def _inv_fetch_asset_type(user_id: int, asset_type_id: int, limit_pages: int = 2, page_size: int = 100):
+def _inv_fetch_asset_type(user_id: int, asset_type_id: int, limit_pages: int = 1, page_size: int = 100):
+    """
+    Returns: (asset_ids or None if private/blocked, status_code, capped_bool)
+    capped_bool=True means there were more pages (so count is "100+" etc)
+    """
     asset_ids: list[int] = []
     cursor = ""
     status_code = None
-    seen = set()
+    capped = False
 
-    for _ in range(limit_pages):
+    for page in range(limit_pages):
         url = f"https://inventory.roblox.com/v2/users/{user_id}/inventory/{asset_type_id}"
         params = {"limit": page_size}
         if cursor:
@@ -260,14 +258,14 @@ def _inv_fetch_asset_type(user_id: int, asset_type_id: int, limit_pages: int = 2
 
         r = http_get(url, params=params, timeout=20, retries=3)
         if isinstance(r, Exception):
-            return asset_ids, None
+            return asset_ids, None, capped
 
         status_code = r.status_code
 
         if r.status_code in (401, 403):
-            return None, r.status_code
+            return None, r.status_code, False
         if r.status_code != 200:
-            return asset_ids, r.status_code
+            return asset_ids, r.status_code, capped
 
         data = r.json()
         items = data.get("data") or []
@@ -277,17 +275,21 @@ def _inv_fetch_asset_type(user_id: int, asset_type_id: int, limit_pages: int = 2
                 asset_ids.append(aid)
 
         cursor = data.get("nextPageCursor")
-        if not cursor:
+        if cursor:
+            # if we stop early due to limit_pages, show 100+ style counts
+            if page == limit_pages - 1:
+                capped = True
+        else:
             break
-        if cursor in seen:
-            break
-        seen.add(cursor)
 
-    return asset_ids, status_code
+    return asset_ids, status_code, capped
 
 def _economy_asset_price(asset_id: int):
+    """
+    economy v2 details frequently returns null price for offsale/collectible items.
+    """
     url = f"https://economy.roblox.com/v2/assets/{asset_id}/details"
-    r = http_get(url, timeout=15, retries=2)
+    r = http_get(url, timeout=12, retries=2)
     if isinstance(r, Exception) or getattr(r, "status_code", None) != 200:
         return None
     data = r.json()
@@ -296,39 +298,40 @@ def _economy_asset_price(asset_id: int):
         return int(price)
     return None
 
-async def compute_value_estimate(user_id: int, max_assets_to_price: int = 120, progress_cb=None):
-    """
-    progress_cb(percent:int, message:str)
-    """
-    max_assets_to_price = clamp(int(max_assets_to_price), 30, 300)
+async def compute_value_estimate(
+    user_id: int,
+    sample_size: int = 50,      # MUCH smaller default = faster
+    concurrency: int = 12,      # price 12 at a time
+    progress_cb=None
+):
+    sample_size = clamp(int(sample_size), 10, 120)
+    concurrency = clamp(int(concurrency), 4, 20)
 
     notes: list[str] = []
-    type_counts: dict[str, int] = {}
+    type_counts: dict[str, str] = {}     # strings so we can show "100+"
+    raw_counts: dict[str, int] = {}
     all_assets: list[int] = []
     status_map: dict[str, int | None] = {}
 
     inventory_private = False
 
-    # Phase 1: fetch inventory by type
+    # Phase 1: quick inventory scan (1 page per type)
     total_types = len(ASSET_TYPES)
     for idx, (asset_type_id, label) in enumerate(ASSET_TYPES, start=1):
         if progress_cb:
-            # 0% -> 40% reserved for inventory fetching
-            pct = int((idx - 1) / max(1, total_types) * 40)
+            pct = int((idx - 1) / max(1, total_types) * 35)
             await progress_cb(pct, f"Scanning inventory… ({label})")
 
-        asset_ids, status = await asyncio.to_thread(_inv_fetch_asset_type, user_id, asset_type_id, 2, 100)
+        asset_ids, status, capped = await asyncio.to_thread(_inv_fetch_asset_type, user_id, asset_type_id, 1, 100)
         status_map[label] = status
 
         if asset_ids is None:
             inventory_private = True
             break
 
-        type_counts[label] = len(asset_ids)
+        raw_counts[label] = len(asset_ids)
+        type_counts[label] = f"{len(asset_ids)}+" if capped else f"{len(asset_ids)}"
         all_assets.extend(asset_ids)
-
-    est_value = None
-    priced_assets = 0
 
     if inventory_private:
         notes.append("Inventory lookup returned 403/401 (privacy or Roblox blocking this host).")
@@ -340,10 +343,10 @@ async def compute_value_estimate(user_id: int, max_assets_to_price: int = 120, p
             "priced_assets": 0,
             "est_value_robux": None,
             "notes": notes,
-            "status_map": status_map
+            "status_map": status_map,
+            "sampled": 0
         }
 
-    # Phase 2: price a sample of assets
     uniq_assets = list(dict.fromkeys(all_assets))
     if not uniq_assets:
         notes.append("No items found in checked categories (or Roblox returned empty lists).")
@@ -355,30 +358,46 @@ async def compute_value_estimate(user_id: int, max_assets_to_price: int = 120, p
             "priced_assets": 0,
             "est_value_robux": None,
             "notes": notes,
-            "status_map": status_map
+            "status_map": status_map,
+            "sampled": 0
         }
 
-    uniq_assets = uniq_assets[:max_assets_to_price]
+    # Phase 2: sample items (randomized) so we’re not stuck with all offsale hats first
+    random.shuffle(uniq_assets)
+    sample = uniq_assets[:sample_size]
+
+    # price with concurrency
+    sem = asyncio.Semaphore(concurrency)
+
+    async def price_one(aid: int):
+        async with sem:
+            return await asyncio.to_thread(_economy_asset_price, aid)
 
     total = 0
-    total_to_price = len(uniq_assets)
+    priced_assets = 0
+    n = len(sample)
 
-    for i, aid in enumerate(uniq_assets, start=1):
-        # 40% -> 95% reserved for pricing
-        if progress_cb and (i == 1 or i % 10 == 0 or i == total_to_price):
-            pct = 40 + int(i / max(1, total_to_price) * 55)
-            await progress_cb(pct, f"Estimating catalog value… ({i}/{total_to_price})")
+    tasks = [asyncio.create_task(price_one(a)) for a in sample]
+    for i, t in enumerate(asyncio.as_completed(tasks), start=1):
+        if progress_cb and (i == 1 or i % 10 == 0 or i == n):
+            pct = 35 + int(i / max(1, n) * 60)
+            await progress_cb(pct, f"Estimating catalog value… ({i}/{n})")
 
-        price = await asyncio.to_thread(_economy_asset_price, aid)
+        price = await t
         if price is not None:
             total += price
             priced_assets += 1
 
-    if priced_assets > 0:
-        est_value = total
-    else:
-        notes.append("Could not read prices for sampled items (offsale/limited/no public price).")
+    est_value = total if priced_assets > 0 else None
 
+    if est_value is None:
+        notes.append(
+            "Could not read prices for the sampled items. Many items are offsale or collectible/limited, "
+            "and Roblox often returns no stable price for them."
+        )
+        # This limitation is widely discussed by devs for limited/collectibles pricing behavior.
+        # (Public inventory doesn’t guarantee price availability.)
+        # See: devforum discussions.
     if progress_cb:
         await progress_cb(100, "Value estimate complete.")
 
@@ -388,7 +407,8 @@ async def compute_value_estimate(user_id: int, max_assets_to_price: int = 120, p
         "priced_assets": priced_assets,
         "est_value_robux": est_value,
         "notes": notes,
-        "status_map": status_map
+        "status_map": status_map,
+        "sampled": len(sample)
     }
 
 # =====================================================
@@ -428,7 +448,6 @@ async def watchgroup(interaction: discord.Interaction, action: str, group_id: st
 
     return await interaction.response.send_message("Actions: add / remove / list", ephemeral=True)
 
-
 @tree.command(name="blacklistrank", description="Flag specific group rank IDs as blacklisted")
 @app_commands.describe(action="add/remove/list", group_id="Roblox group id", rank_id="Roblox rank id (0-255)", reason="Optional reason")
 async def blacklistrank(interaction: discord.Interaction, action: str, group_id: str | None = None, rank_id: int | None = None, reason: str | None = None):
@@ -467,7 +486,6 @@ async def blacklistrank(interaction: discord.Interaction, action: str, group_id:
 
     return await interaction.response.send_message("Actions: add / remove / list", ephemeral=True)
 
-
 @tree.command(name="blacklistuser", description="Blacklist a Roblox userId (hard flag in /bgcheck)")
 @app_commands.describe(action="add/remove/check", roblox_id="Roblox user id", reason="Reason for blacklist")
 async def blacklistuser(interaction: discord.Interaction, action: str, roblox_id: str, reason: str | None = None):
@@ -500,7 +518,6 @@ async def blacklistuser(interaction: discord.Interaction, action: str, roblox_id
         return await interaction.response.send_message(f"🚫 Blacklisted — {row['reason']} (since {fmt_date(row['added_at'])})", ephemeral=True)
 
     return await interaction.response.send_message("Actions: add / remove / check", ephemeral=True)
-
 
 @tree.command(name="ranklock", description="Set/view/remove a max rank cap for a Roblox user in a group")
 @app_commands.describe(
@@ -550,7 +567,7 @@ async def ranklock(interaction: discord.Interaction, action: str, roblox_id: str
     return await interaction.response.send_message("Actions: set / remove / view", ephemeral=True)
 
 # =====================================================
-# /bgcheck (groups + flags + show_all + include_value + progress)
+# /bgcheck
 # =====================================================
 
 @tree.command(name="bgcheck", description="Background check a Roblox account (groups + flags + optional value)")
@@ -559,7 +576,8 @@ async def ranklock(interaction: discord.Interaction, action: str, roblox_id: str
     roblox_id="Roblox userId",
     username="Roblox username",
     show_all="Show every group (otherwise watched + flagged only)",
-    include_value="Estimate inventory/catalog value (best-effort; slower)"
+    include_value="Estimate inventory/catalog value (fast best-effort)",
+    value_sample="How many items to sample for pricing (10-120)"
 )
 async def bgcheck(
     interaction: discord.Interaction,
@@ -567,7 +585,8 @@ async def bgcheck(
     roblox_id: str | None = None,
     username: str | None = None,
     show_all: bool = False,
-    include_value: bool = False
+    include_value: bool = False,
+    value_sample: int = 50
 ):
     await interaction.response.defer(ephemeral=True)
 
@@ -677,18 +696,16 @@ async def bgcheck(
 
     group_chunks = chunk_lines(lines, 1024)
 
-    # --- progress message (only if include_value) ---
+    # progress message (value only)
     progress_msg = None
     last_update = 0.0
 
     async def progress_cb(percent: int, message: str):
         nonlocal progress_msg, last_update
         now = time.time()
-        # throttle updates (avoid Discord rate limits)
         if (now - last_update) < 1.25 and percent < 100:
             return
         last_update = now
-
         text = f"⏳ **Value calc:** {percent}% — {message}"
         try:
             if progress_msg is None:
@@ -700,11 +717,15 @@ async def bgcheck(
 
     value_est = None
     if include_value:
-        # start progress asap
         await progress_cb(0, "Starting…")
-        value_est = await compute_value_estimate(target_roblox_id, max_assets_to_price=120, progress_cb=progress_cb)
+        value_est = await compute_value_estimate(
+            target_roblox_id,
+            sample_size=value_sample,
+            concurrency=12,
+            progress_cb=progress_cb
+        )
 
-    # --- Build Embed ---
+    # Build Embed
     title_name = f"{user['name']} ({user['displayName']})"
     embed = discord.Embed(
         title="Roblox Background Check",
@@ -712,41 +733,37 @@ async def bgcheck(
         color=0x2f3136
     )
 
-    embed.add_field(
-        name="Account",
-        value=f"Created: **{created_date}**\nAge: **{age_days} days**",
-        inline=True
-    )
-
-    embed.add_field(
-        name="Summary",
-        value=f"Watched in: **{watched_count}**\nFlags: **{flagged_count}**\nTotal groups: **{len(groups_sorted)}**",
-        inline=True
-    )
+    embed.add_field(name="Account", value=f"Created: **{created_date}**\nAge: **{age_days} days**", inline=True)
+    embed.add_field(name="Summary", value=f"Watched in: **{watched_count}**\nFlags: **{flagged_count}**\nTotal groups: **{len(groups_sorted)}**", inline=True)
 
     if not db_ok:
-        embed.add_field(
-            name="DB Status",
-            value="⚠️ Database not connected — watched/blacklist/ranklock features disabled.",
-            inline=False
-        )
+        embed.add_field(name="DB Status", value="⚠️ Database not connected — watched/blacklist/ranklock features disabled.", inline=False)
 
     if notes:
         embed.add_field(name="Notes", value="\n".join([f"• {safe_text(n, 200)}" for n in notes])[:1024], inline=False)
 
-    # Value results section
+    # Value results
     if include_value and value_est is not None:
         if value_est["inventory_private"]:
             inv_line = "Inventory: **Private/Blocked**"
+            val_line = "Est. catalog value: **N/A**"
         else:
-            total_items = sum(value_est["type_counts"].values())
-            top_types = sorted(value_est["type_counts"].items(), key=lambda kv: kv[1], reverse=True)[:5]
-            top_txt = ", ".join([f"{k}: {v}" for k, v in top_types if v > 0]) or "no items found"
-            inv_line = f"Items checked: **{total_items}** (top: {safe_text(top_txt, 140)})"
+            # show top 5 categories by count string
+            # convert strings to sort by numeric prefix
+            def num_prefix(s: str) -> int:
+                try:
+                    return int(s.replace("+", ""))
+                except Exception:
+                    return 0
 
-        val_line = "Est. catalog value: **N/A**"
-        if value_est["est_value_robux"] is not None:
-            val_line = f"Est. catalog value (sampled): **{value_est['est_value_robux']:,} R$** *(priced {value_est['priced_assets']} items)*"
+            top_types = sorted(value_est["type_counts"].items(), key=lambda kv: num_prefix(kv[1]), reverse=True)[:5]
+            top_txt = ", ".join([f"{k}: {v}" for k, v in top_types if kv[1] != "0"]) if top_types else "n/a"
+            inv_line = f"Sampled **{value_est['sampled']}** items (top: {safe_text(top_txt, 140)})"
+
+            if value_est["est_value_robux"] is None:
+                val_line = "Est. catalog value (sampled): **N/A** *(Roblox returned no prices for the sampled items)*"
+            else:
+                val_line = f"Est. catalog value (sampled): **{value_est['est_value_robux']:,} R$** *(priced {value_est['priced_assets']} of {value_est['sampled']})*"
 
         status_bits = []
         for label, code in value_est["status_map"].items():
@@ -754,7 +771,7 @@ async def bgcheck(
         status_line = safe_text(" | ".join(status_bits), 900)
 
         embed.add_field(
-            name="Value Estimate (Best-Effort)",
+            name="Value Estimate (Fast Best-Effort)",
             value=f"{inv_line}\n{val_line}\n`{status_line}`",
             inline=False
         )
@@ -762,7 +779,7 @@ async def bgcheck(
         if value_est["notes"]:
             embed.add_field(
                 name="Value Notes",
-                value="\n".join([f"• {safe_text(n, 200)}" for n in value_est["notes"]])[:1024],
+                value="\n".join([f"• {safe_text(n, 250)}" for n in value_est["notes"]])[:1024],
                 inline=False
             )
 
@@ -772,7 +789,6 @@ async def bgcheck(
 
     embed.set_footer(text=f"Checked by {interaction.user}")
 
-    # update progress msg to "done"
     if include_value:
         await progress_cb(100, "Done.")
         try:
