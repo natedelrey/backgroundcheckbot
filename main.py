@@ -1,5 +1,8 @@
 import os
 import re
+import math
+import time
+import asyncio
 import requests
 import discord
 from discord import app_commands
@@ -65,23 +68,79 @@ create table if not exists ranklocks (
 );
 """
 
+async def ensure_db():
+    global db_pool
+
+    if db_pool is not None:
+        return True
+
+    if not DATABASE_URL:
+        print("⚠️ DATABASE_URL missing — DB features disabled.")
+        return False
+
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with db_pool.acquire() as con:
+            await con.execute(CREATE_TABLES_SQL)
+        print("✅ DB connected and tables ensured.")
+        return True
+    except Exception as e:
+        print(f"⚠️ DB connection failed — DB features disabled. Error: {e}")
+        db_pool = None
+        return False
+
 async def db_exec(sql: str, *args):
+    if not await ensure_db():
+        return None
     assert db_pool is not None
     async with db_pool.acquire() as con:
         return await con.execute(sql, *args)
 
 async def db_fetch(sql: str, *args):
+    if not await ensure_db():
+        return []
     assert db_pool is not None
     async with db_pool.acquire() as con:
         return await con.fetch(sql, *args)
 
 async def db_fetchrow(sql: str, *args):
+    if not await ensure_db():
+        return None
     assert db_pool is not None
     async with db_pool.acquire() as con:
         return await con.fetchrow(sql, *args)
 
 # =====================================================
-# Roblox / RoVer helpers
+# Helpers
+# =====================================================
+
+def safe_text(s: str, max_len: int) -> str:
+    s = re.sub(r"\s+", " ", (s or "")).strip()
+    return s if len(s) <= max_len else (s[: max_len - 1] + "…")
+
+def fmt_date(dt: datetime | None) -> str:
+    if not dt:
+        return "unknown"
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+
+def chunk_lines(lines: list[str], max_chars: int = 1024) -> list[str]:
+    chunks = []
+    cur = ""
+    for line in lines:
+        if len(cur) + len(line) + 1 > max_chars:
+            if cur.strip():
+                chunks.append(cur.rstrip())
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        chunks.append(cur.rstrip())
+    return chunks
+
+def clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+# =====================================================
+# Roblox / RoVer helpers (sync, wrapped by asyncio.to_thread)
 # =====================================================
 
 def discord_to_roblox(guild_id: int, discord_id: int) -> int | None:
@@ -121,31 +180,241 @@ def account_age_days(created_iso: str) -> int:
     created_dt = datetime.fromisoformat(created_iso.replace("Z", "+00:00"))
     return (datetime.now(timezone.utc) - created_dt).days
 
-def safe_text(s: str, max_len: int) -> str:
-    s = re.sub(r"\s+", " ", s).strip()
-    return s if len(s) <= max_len else (s[: max_len - 1] + "…")
+# =====================================================
+# Inventory + Value estimation (best effort)
+# =====================================================
 
-def fmt_date(dt: datetime | None) -> str:
-    if not dt:
-        return "unknown"
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+# Common avatar-ish asset type IDs used with inventory.roblox.com/v2/users/{userId}/inventory/{assetTypeId}
+# (This endpoint is officially documented, but not every type is guaranteed to work for every account.)
+ASSET_TYPES = [
+    (8, "Hats"),
+    (41, "Hair"),
+    (42, "Face Acc"),
+    (43, "Neck Acc"),
+    (44, "Shoulder Acc"),
+    (45, "Front Acc"),
+    (46, "Back Acc"),
+    (47, "Waist Acc"),
+    (2, "T-Shirts"),
+    (11, "Shirts"),
+    (12, "Pants"),
+    (18, "Faces"),
+]
 
-def chunk_lines(lines: list[str], max_chars: int = 1024) -> list[str]:
-    chunks = []
-    cur = ""
-    for line in lines:
-        # +1 newline
-        if len(cur) + len(line) + 1 > max_chars:
-            if cur.strip():
-                chunks.append(cur.rstrip())
-            cur = ""
-        cur += line + "\n"
-    if cur.strip():
-        chunks.append(cur.rstrip())
-    return chunks
+def _inv_fetch_asset_type(user_id: int, asset_type_id: int, limit_pages: int = 3, page_size: int = 100):
+    """
+    Returns list of assetIds for this asset type.
+    Stops after limit_pages to avoid hammering Roblox.
+    If inventory is private or endpoint blocks, returns None.
+    """
+    asset_ids: list[int] = []
+    cursor = ""
+    seen_cursors = set()
+
+    for _ in range(limit_pages):
+        url = f"https://inventory.roblox.com/v2/users/{user_id}/inventory/{asset_type_id}"
+        params = {"limit": page_size}
+        if cursor:
+            params["cursor"] = cursor
+
+        r = requests.get(url, params=params, timeout=20)
+
+        if r.status_code in (401, 403):
+            return None  # private inventory / blocked
+        if r.status_code != 200:
+            return asset_ids  # partial
+
+        data = r.json()
+        items = data.get("data") or []
+        for it in items:
+            # usually: it["assetId"] exists
+            aid = it.get("assetId") or it.get("id")
+            if isinstance(aid, int):
+                asset_ids.append(aid)
+
+        cursor = data.get("nextPageCursor")
+        if not cursor:
+            break
+
+        # guard against cursor loops
+        if cursor in seen_cursors:
+            break
+        seen_cursors.add(cursor)
+
+    return asset_ids
+
+
+def _economy_asset_price(asset_id: int):
+    """
+    Best-effort price lookup.
+    economy.roblox.com/v2/assets/{assetId}/details often returns "price" for catalog assets.
+    If offsale/limited/etc, price might be None or 0.
+    """
+    url = f"https://economy.roblox.com/v2/assets/{asset_id}/details"
+    r = requests.get(url, timeout=15)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    price = data.get("price")
+    if isinstance(price, (int, float)) and price > 0:
+        return int(price)
+    return None
+
+
+def _gamepasses_owned(user_id: int, max_pages: int = 3, count: int = 100):
+    """
+    Lists gamepasses a user owns using:
+    https://apis.roblox.com/game-passes/v1/users/{USERID}/game-passes?count=100&exclusiveStartId=...
+    (Endpoint pattern discussed on Roblox DevForum)  :contentReference[oaicite:3]{index=3}
+    Returns list of gamePassIds (ints), or None if blocked.
+    """
+    gamepass_ids: list[int] = []
+    exclusive_start_id = 0
+
+    for _ in range(max_pages):
+        url = f"https://apis.roblox.com/game-passes/v1/users/{user_id}/game-passes"
+        params = {"count": count, "exclusiveStartId": exclusive_start_id}
+        r = requests.get(url, params=params, timeout=20)
+
+        if r.status_code in (401, 403):
+            return None
+        if r.status_code != 200:
+            return gamepass_ids
+
+        data = r.json()
+
+        # response shape varies; try common keys
+        items = data.get("gamePasses") or data.get("data") or data.get("gamepasses") or []
+        if not items:
+            break
+
+        for gp in items:
+            gpid = gp.get("gamePassId") or gp.get("id")
+            if isinstance(gpid, int):
+                gamepass_ids.append(gpid)
+
+        # pagination: set exclusive_start_id to last ID
+        exclusive_start_id = gamepass_ids[-1] if gamepass_ids else 0
+
+        # if fewer than requested, we’re done
+        if len(items) < count:
+            break
+
+    return gamepass_ids
+
+
+def _gamepass_price(gamepass_id: int):
+    """
+    Tries to read price from game pass details endpoint:
+    GET apis.roblox.com/game-passes/v1/game-passes/{gamePassId}/details
+    Mentioned in Roblox announcements. :contentReference[oaicite:4]{index=4}
+    This may be blocked/limited unauthenticated; if so returns None.
+    """
+    url = f"https://apis.roblox.com/game-passes/v1/game-passes/{gamepass_id}/details"
+    r = requests.get(url, timeout=15)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    price = data.get("price")
+    if isinstance(price, (int, float)) and price > 0:
+        return int(price)
+    return None
+
+
+async def compute_value_estimate(user_id: int, max_assets_to_price: int = 120):
+    """
+    Returns dict:
+      {
+        "inventory_private": bool,
+        "type_counts": {label: count},
+        "priced_assets": n,
+        "est_value_robux": int or None,
+        "gamepasses_count": int or None,
+        "gamepasses_priced": int,
+        "gamepasses_value_robux": int or None,
+        "notes": [str]
+      }
+    """
+    # Settings: keep it light so Railway doesn’t get cooked
+    max_assets_to_price = clamp(max_assets_to_price, 30, 300)
+
+    notes: list[str] = []
+    type_counts: dict[str, int] = {}
+    all_assets: list[int] = []
+
+    inventory_private = False
+
+    # Fetch inventory ids per type (few pages each)
+    for asset_type_id, label in ASSET_TYPES:
+        asset_ids = await asyncio.to_thread(_inv_fetch_asset_type, user_id, asset_type_id, 2, 100)
+        if asset_ids is None:
+            inventory_private = True
+            break
+        type_counts[label] = len(asset_ids)
+        all_assets.extend(asset_ids)
+
+    est_value = None
+    priced_assets = 0
+
+    if inventory_private:
+        notes.append("Inventory appears private or blocked (Roblox returned 403/401).")
+    else:
+        # Deduplicate and limit pricing calls
+        uniq_assets = list(dict.fromkeys(all_assets))
+        if not uniq_assets:
+            notes.append("No inventory items found in checked categories.")
+        else:
+            # Sample first N (sorted for stable-ish output)
+            uniq_assets = uniq_assets[:max_assets_to_price]
+
+            total = 0
+            for aid in uniq_assets:
+                price = await asyncio.to_thread(_economy_asset_price, aid)
+                if price is not None:
+                    total += price
+                    priced_assets += 1
+
+            if priced_assets > 0:
+                est_value = total
+            else:
+                notes.append("Could not read prices for sampled items (many items are offsale/limited/no price).")
+
+    # Gamepasses owned
+    gp_ids = await asyncio.to_thread(_gamepasses_owned, user_id, 3, 100)
+    gamepasses_count = None if gp_ids is None else len(gp_ids)
+
+    gp_value = None
+    gp_priced = 0
+    if gp_ids is None:
+        notes.append("Gamepass ownership lookup blocked/private.")
+    else:
+        # Try pricing a small sample (avoid spamming)
+        sample = gp_ids[:30]
+        total_gp = 0
+        for gpid in sample:
+            p = await asyncio.to_thread(_gamepass_price, gpid)
+            if p is not None:
+                total_gp += p
+                gp_priced += 1
+        if gp_priced > 0:
+            gp_value = total_gp
+        else:
+            # Not always possible without auth; call it out
+            notes.append("Gamepass prices not available via public endpoint (count shown only).")
+
+    return {
+        "inventory_private": inventory_private,
+        "type_counts": type_counts,
+        "priced_assets": priced_assets,
+        "est_value_robux": est_value,
+        "gamepasses_count": gamepasses_count,
+        "gamepasses_priced": gp_priced,
+        "gamepasses_value_robux": gp_value,
+        "notes": notes
+    }
 
 # =====================================================
-# Config commands
+# Commands: watched / blacklist / ranklock (same as before)
 # =====================================================
 
 @tree.command(name="watchgroup", description="Manage watched Roblox groups (shown in /bgcheck)")
@@ -213,9 +482,10 @@ async def blacklistrank(interaction: discord.Interaction, action: str, group_id:
         if not rows:
             return await interaction.response.send_message("No blacklisted ranks set.", ephemeral=True)
         lines = [f"• `{r['group_id']}` rank **{r['rank_id']}** — {r['reason'] or 'no reason'}" for r in rows]
-        chunks = chunk_lines(lines, 1800)
-        # send first chunk (ephemeral message limit is bigger than embed limits)
-        return await interaction.response.send_message(chunks[0], ephemeral=True)
+        msg = "\n".join(lines[:80])
+        if len(lines) > 80:
+            msg += f"\n...and {len(lines)-80} more"
+        return await interaction.response.send_message(msg, ephemeral=True)
 
     return await interaction.response.send_message("Actions: add / remove / list", ephemeral=True)
 
@@ -253,18 +523,9 @@ async def blacklistuser(interaction: discord.Interaction, action: str, roblox_id
 
     return await interaction.response.send_message("Actions: add / remove / check", ephemeral=True)
 
-# =====================================================
-# Ranklock (DB)
-# =====================================================
 
 @tree.command(name="ranklock", description="Set/view/remove a max rank cap for a Roblox user in a group")
-@app_commands.describe(
-    action="set/remove/view",
-    roblox_id="Roblox user ID",
-    group_id="Roblox group ID (needed for set/remove)",
-    max_rank_id="Max allowed rank id (needed for set)",
-    reason="Reason (needed for set)"
-)
+@app_commands.describe(action="set/remove/view", roblox_id="Roblox user ID", group_id="Roblox group ID", max_rank_id="Max allowed rank id", reason="Reason")
 async def ranklock(interaction: discord.Interaction, action: str, roblox_id: str, group_id: str | None = None, max_rank_id: int | None = None, reason: str | None = None):
     if not interaction.user.guild_permissions.manage_roles and not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ You need **Manage Roles** (or Admin).", ephemeral=True)
@@ -305,81 +566,86 @@ async def ranklock(interaction: discord.Interaction, action: str, roblox_id: str
     return await interaction.response.send_message("Actions: set / remove / view", ephemeral=True)
 
 # =====================================================
-# /bgcheck (pretty + watched groups + flags)
+# /bgcheck (clean + watched + flags + value estimate)
 # =====================================================
 
 @tree.command(name="bgcheck", description="Background check a Roblox account (clean + flagged results)")
 @app_commands.describe(
-    discord_user="Discord user (uses RoVer verification)",
+    discord_user="Discord user (RoVer)",
     roblox_id="Roblox userId",
     username="Roblox username",
-    show_all="Show every group (normally it shows watched + flagged only)"
+    show_all="Show every group",
+    include_value="Estimate inventory + gamepass value (best-effort; may be slow)"
 )
 async def bgcheck(
     interaction: discord.Interaction,
     discord_user: discord.Member | None = None,
     roblox_id: str | None = None,
     username: str | None = None,
-    show_all: bool = False
+    show_all: bool = False,
+    include_value: bool = False
 ):
     await interaction.response.defer(ephemeral=True)
 
-    # --- resolve roblox userId ---
+    db_ok = await ensure_db()
+
+    # Resolve Roblox ID
     target_roblox_id: int | None = None
     if discord_user:
-        target_roblox_id = discord_to_roblox(int(interaction.guild_id), int(discord_user.id))
+        target_roblox_id = await asyncio.to_thread(discord_to_roblox, int(interaction.guild_id), int(discord_user.id))
         if not target_roblox_id:
             return await interaction.followup.send("❌ That Discord user is not verified with RoVer.")
     elif roblox_id:
         target_roblox_id = int(roblox_id)
     elif username:
-        target_roblox_id = username_to_roblox(username)
+        target_roblox_id = await asyncio.to_thread(username_to_roblox, username)
         if not target_roblox_id:
             return await interaction.followup.send("❌ Roblox username not found.")
     else:
         return await interaction.followup.send("❌ Provide discord_user OR roblox_id OR username.")
 
-    # --- fetch roblox data ---
-    user = get_roblox_user(target_roblox_id)
-    groups = get_user_groups(target_roblox_id)
-
-    # sort groups by name
+    user = await asyncio.to_thread(get_roblox_user, target_roblox_id)
+    groups = await asyncio.to_thread(get_user_groups, target_roblox_id)
     groups_sorted = sorted(groups, key=lambda x: (x["group"]["name"] or "").lower())
 
-    # --- load config/rules ---
-    guild_id = int(interaction.guild_id)
+    watched_map = {}
+    blrank_map = {}
+    user_blacklist = None
+    ranklock_map = {}
 
-    watched = await db_fetch("select group_id, label from watched_groups where guild_id=$1", guild_id)
-    watched_map = {int(r["group_id"]): (r["label"] or None) for r in watched}
+    if db_ok:
+        watched = await db_fetch("select group_id, label from watched_groups where guild_id=$1", int(interaction.guild_id))
+        watched_map = {int(r["group_id"]): (r["label"] or None) for r in watched}
 
-    blacklisted_rank_rows = await db_fetch("select group_id, rank_id, reason from blacklisted_ranks where guild_id=$1", guild_id)
-    blrank_map: dict[tuple[int, int], str | None] = {(int(r["group_id"]), int(r["rank_id"])): (r["reason"] or None) for r in blacklisted_rank_rows}
+        bl_rows = await db_fetch("select group_id, rank_id, reason from blacklisted_ranks where guild_id=$1", int(interaction.guild_id))
+        blrank_map = {(int(r["group_id"]), int(r["rank_id"])): (r["reason"] or None) for r in bl_rows}
 
-    user_blacklist = await db_fetchrow("select reason, added_at from blacklisted_users where guild_id=$1 and roblox_user_id=$2", guild_id, target_roblox_id)
+        user_blacklist = await db_fetchrow(
+            "select reason, added_at from blacklisted_users where guild_id=$1 and roblox_user_id=$2",
+            int(interaction.guild_id), target_roblox_id
+        )
 
-    ranklocks = await db_fetch(
-        "select group_id, max_rank_id, reason, set_at from ranklocks where guild_id=$1 and roblox_user_id=$2",
-        guild_id, target_roblox_id
-    )
-    ranklock_map = {int(r["group_id"]): r for r in ranklocks}
+        rls = await db_fetch(
+            "select group_id, max_rank_id, reason, set_at from ranklocks where guild_id=$1 and roblox_user_id=$2",
+            int(interaction.guild_id), target_roblox_id
+        )
+        ranklock_map = {int(r["group_id"]): r for r in rls}
 
-    # --- compute trust + flags ---
     age_days = account_age_days(user["created"])
     created_date = user["created"][:10]
 
-    trust_notes = []
+    notes = []
     if age_days < 7:
-        trust_notes.append("Very new account (<7 days)")
+        notes.append("Very new account (<7 days)")
     elif age_days < 30:
-        trust_notes.append("New-ish account (<30 days)")
+        notes.append("New-ish account (<30 days)")
 
     if user_blacklist:
-        trust_notes.append(f"🚫 Blacklisted user: {user_blacklist['reason']} (since {fmt_date(user_blacklist['added_at'])})")
+        notes.append(f"🚫 Blacklisted user: {user_blacklist['reason']} (since {fmt_date(user_blacklist['added_at'])})")
 
-    # --- build group lines (watched + flagged; or all) ---
     lines = []
-    flagged_count = 0
     watched_count = 0
+    flagged_count = 0
 
     for g in groups_sorted:
         gid = int(g["group"]["id"])
@@ -402,7 +668,6 @@ async def bgcheck(
             rl_flag = rank_id > max_rank
             rl_txt = f" | RL max **{max_rank}** ({'⚠️ exceeds' if rl_flag else 'ok'}) set {fmt_date(rl['set_at'])}"
 
-        # Decide if we show it
         should_show = show_all or is_watched or is_blacklisted_rank or rl_flag
         if not should_show:
             continue
@@ -424,14 +689,12 @@ async def bgcheck(
         line = f"{icon} **{safe_text(display_name, 42)}** (`{gid}`) — **{rank_id}** ({safe_text(role_name, 40)}){extra}{rl_txt}"
         lines.append(line)
 
-    # fallback if nothing to show
     if not lines and not show_all:
         lines = ["No watched/flagged groups matched. (Use `show_all:true` to display every group.)"]
 
-    # chunk lines into embed fields
     chunks = chunk_lines(lines, 1024)
 
-    # --- embed layout ---
+    # --------- Embed ----------
     title_name = f"{user['name']} ({user['displayName']})"
     embed = discord.Embed(
         title="Roblox Background Check",
@@ -444,28 +707,66 @@ async def bgcheck(
         value=f"Created: **{created_date}**\nAge: **{age_days} days**",
         inline=True
     )
-
     embed.add_field(
         name="Summary",
         value=f"Watched in: **{watched_count}**\nFlags: **{flagged_count}**\nTotal groups: **{len(groups_sorted)}**",
         inline=True
     )
 
-    if trust_notes:
-        embed.add_field(name="Notes", value="\n".join([f"• {safe_text(n, 180)}" for n in trust_notes])[:1024], inline=False)
-
-    # Add group fields (keep under Discord 25-field cap)
-    # We already used 2 fields, + maybe Notes. So allow up to 20 chunks.
-    max_group_fields = 20
-    for i, chunk in enumerate(chunks[:max_group_fields]):
+    if not db_ok:
         embed.add_field(
-            name="Groups" if i == 0 else f"Groups (cont. {i})",
-            value=chunk,
+            name="DB Status",
+            value="⚠️ Database not connected — watched/blacklist/ranklock features disabled.",
             inline=False
         )
 
-    embed.set_footer(text=f"Checked by {interaction.user}")
+    if notes:
+        embed.add_field(name="Notes", value="\n".join([f"• {safe_text(n, 200)}" for n in notes])[:1024], inline=False)
 
+    # --------- Inventory / value estimate ----------
+    if include_value:
+        # Keep pricing calls reasonable for public endpoints
+        est = await compute_value_estimate(target_roblox_id, max_assets_to_price=120)
+
+        # counts summary
+        if est["inventory_private"]:
+            inv_line = "Inventory: **Private/Blocked**"
+        else:
+            total_items = sum(est["type_counts"].values())
+            top_types = sorted(est["type_counts"].items(), key=lambda kv: kv[1], reverse=True)[:4]
+            top_txt = ", ".join([f"{k}: {v}" for k, v in top_types if v > 0]) or "no items found"
+            inv_line = f"Items checked: **{total_items}** (top: {safe_text(top_txt, 120)})"
+
+        # value
+        val_line = "Est. catalog value: **N/A**"
+        if est["est_value_robux"] is not None:
+            val_line = f"Est. catalog value (sampled): **{est['est_value_robux']:,} R$**  *(priced {est['priced_assets']} items)*"
+
+        # gamepasses
+        gp_line = "Owned gamepasses: **N/A**"
+        if est["gamepasses_count"] is not None:
+            gp_line = f"Owned gamepasses: **{est['gamepasses_count']}**"
+            if est["gamepasses_value_robux"] is not None:
+                gp_line += f" | Est. value (sampled): **{est['gamepasses_value_robux']:,} R$** *(priced {est['gamepasses_priced']} passes)*"
+
+        embed.add_field(
+            name="Value Estimate (Best-Effort)",
+            value=f"{inv_line}\n{val_line}\n{gp_line}",
+            inline=False
+        )
+
+        if est["notes"]:
+            embed.add_field(
+                name="Value Notes",
+                value="\n".join([f"• {safe_text(n, 200)}" for n in est["notes"]])[:1024],
+                inline=False
+            )
+
+    # Groups section
+    for i, chunk in enumerate(chunks[:20]):
+        embed.add_field(name="Groups" if i == 0 else f"Groups (cont. {i})", value=chunk, inline=False)
+
+    embed.set_footer(text=f"Checked by {interaction.user}")
     await interaction.followup.send(embed=embed)
 
 # =====================================================
@@ -474,15 +775,7 @@ async def bgcheck(
 
 @client.event
 async def on_ready():
-    global db_pool
-    if db_pool is None:
-        if not DATABASE_URL:
-            print("❌ DATABASE_URL missing. Add Railway Postgres and set DATABASE_URL.")
-            return
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        await db_exec(CREATE_TABLES_SQL)
-        print("✅ DB ready (tables ensured).")
-
+    await ensure_db()
     await tree.sync()
     print(f"✅ Logged in as {client.user}")
 
