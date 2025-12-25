@@ -276,7 +276,6 @@ def _inv_fetch_asset_type(user_id: int, asset_type_id: int, limit_pages: int = 1
 
         cursor = data.get("nextPageCursor")
         if cursor:
-            # if we stop early due to limit_pages, show 100+ style counts
             if page == limit_pages - 1:
                 capped = True
         else:
@@ -300,22 +299,20 @@ def _economy_asset_price(asset_id: int):
 
 async def compute_value_estimate(
     user_id: int,
-    sample_size: int = 50,      # MUCH smaller default = faster
-    concurrency: int = 12,      # price 12 at a time
+    sample_size: int = 50,
+    concurrency: int = 12,
     progress_cb=None
 ):
     sample_size = clamp(int(sample_size), 10, 120)
     concurrency = clamp(int(concurrency), 4, 20)
 
     notes: list[str] = []
-    type_counts: dict[str, str] = {}     # strings so we can show "100+"
-    raw_counts: dict[str, int] = {}
+    type_counts: dict[str, str] = {}
     all_assets: list[int] = []
     status_map: dict[str, int | None] = {}
 
     inventory_private = False
 
-    # Phase 1: quick inventory scan (1 page per type)
     total_types = len(ASSET_TYPES)
     for idx, (asset_type_id, label) in enumerate(ASSET_TYPES, start=1):
         if progress_cb:
@@ -329,7 +326,6 @@ async def compute_value_estimate(
             inventory_private = True
             break
 
-        raw_counts[label] = len(asset_ids)
         type_counts[label] = f"{len(asset_ids)}+" if capped else f"{len(asset_ids)}"
         all_assets.extend(asset_ids)
 
@@ -362,11 +358,9 @@ async def compute_value_estimate(
             "sampled": 0
         }
 
-    # Phase 2: sample items (randomized) so we’re not stuck with all offsale hats first
     random.shuffle(uniq_assets)
     sample = uniq_assets[:sample_size]
 
-    # price with concurrency
     sem = asyncio.Semaphore(concurrency)
 
     async def price_one(aid: int):
@@ -395,9 +389,7 @@ async def compute_value_estimate(
             "Could not read prices for the sampled items. Many items are offsale or collectible/limited, "
             "and Roblox often returns no stable price for them."
         )
-        # This limitation is widely discussed by devs for limited/collectibles pricing behavior.
-        # (Public inventory doesn’t guarantee price availability.)
-        # See: devforum discussions.
+
     if progress_cb:
         await progress_cb(100, "Value estimate complete.")
 
@@ -748,8 +740,6 @@ async def bgcheck(
             inv_line = "Inventory: **Private/Blocked**"
             val_line = "Est. catalog value: **N/A**"
         else:
-            # show top 5 categories by count string
-            # convert strings to sort by numeric prefix
             def num_prefix(s: str) -> int:
                 try:
                     return int(s.replace("+", ""))
@@ -757,7 +747,7 @@ async def bgcheck(
                     return 0
 
             top_types = sorted(value_est["type_counts"].items(), key=lambda kv: num_prefix(kv[1]), reverse=True)[:5]
-          top_txt = ", ".join([f"{k}: {v}" for k, v in top_types if v != "0"]) if top_types else "n/a"
+            top_txt = ", ".join([f"{k}: {v}" for k, v in top_types if v != "0"]) if top_types else "n/a"
             inv_line = f"Sampled **{value_est['sampled']}** items (top: {safe_text(top_txt, 140)})"
 
             if value_est["est_value_robux"] is None:
